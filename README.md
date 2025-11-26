@@ -7,16 +7,19 @@ Create venv environment
 python -m venv hdlloopenv
 ```
 
-Activate venv environment
+Activate venv environment in windows
 ```
 .\hdlloopenv\Scripts\activate 
 ```
 
+Activate venv environment in mac
+```
+source ./hdlloopenv/bin/activate
+```
+
 Install dependencies for the first time
 ```
-pip install chonkie[code]
-pip install langfuse
-pip install python-dotenv
+pip install chonkie[code] langfuse python-dotenv
 ```
 
 ### Environment variables
