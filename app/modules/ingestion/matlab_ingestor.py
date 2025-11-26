@@ -11,7 +11,7 @@ class MatlabIngestor:
     Ingests and chunks MATLAB code files using Chonkie with a fallback mechanism.
     """
 
-    def __init__(self, chunk_size: int = 1000):
+    def __init__(self, chunk_size: int = 2048):
         """
         Initialize the MatlabIngestor.
 

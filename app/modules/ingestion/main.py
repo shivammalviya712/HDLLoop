@@ -7,11 +7,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
 
-try:
-    from matlab_ingestor import MatlabIngestor
-except ImportError:
-    # Fallback for when running from project root using module syntax
-    from app.modules.ingestion.matlab_ingestor import MatlabIngestor
+from matlab_ingestor import MatlabIngestor
 
 def main():
     # Load environment variables
@@ -30,7 +26,7 @@ def main():
 
         # 2. Instantiation
         # Initialize with small chunk size to ensure we get multiple chunks for the test file
-        ingestor = MatlabIngestor(chunk_size=50)
+        ingestor = MatlabIngestor()
         print("MatlabIngestor instantiated.")
         
         # 3. Execution
