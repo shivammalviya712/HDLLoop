@@ -3,70 +3,94 @@ from pathlib import Path
 from langchain_community.chat_message_histories import ChatMessageHistory
 import shutil
 
-from app.modules.agent.matlab_agent import MatlabAgent # Assuming same directory for this example
+from hdlagent import MatlabAgent
 
 TEMP_DIR = Path("temp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+
 @cl.on_chat_start
 async def start():
     cl.user_session.set("agent", MatlabAgent())
-    cl.user_session.set("history", ChatMessageHistory()) 
-    cl.user_session.set("active_file", None)
+    cl.user_session.set("history", ChatMessageHistory())
+    # List of absolute file paths for HDL files
+    cl.user_session.set("hdl_files", [])
 
 
 @cl.on_message
 async def main(message: cl.Message):
-    agent = cl.user_session.get("agent")
-    history = cl.user_session.get("history")
-    current_file = cl.user_session.get("active_file")
+    agent: MatlabAgent = cl.user_session.get("agent")
+    history: ChatMessageHistory = cl.user_session.get("history")
+    hdl_files: list[str] = cl.user_session.get("hdl_files") or []
 
-    # Handle file upload
+    # --- 1. HANDLE HDL FILE UPLOAD(S) ---
+    newly_added: list[Path] = []
     if message.elements:
-        file_el = message.elements[0]
-        if file_el.path:
-            dest = TEMP_DIR / file_el.name
-            shutil.copy(file_el.path, dest)
-            current_file = str(dest)
-            cl.user_session.set("active_file", current_file)
-            await cl.Message(f"Focused on {file_el.name}").send()
+        for el in message.elements:
+            if not getattr(el, "path", None):
+                continue
+            dest = TEMP_DIR / el.name
+            shutil.copy(el.path, dest)
+            hdl_files.append(str(dest))
+            newly_added.append(dest)
 
-    final_msg = cl.Message(content="")
-    await final_msg.send()
+        cl.user_session.set("hdl_files", hdl_files)
 
-    think_step = None
+        if newly_added:
+            names = ", ".join(p.name for p in newly_added)
+            total = ", ".join(Path(p).name for p in hdl_files)
+            await cl.Message(
+                f"✅ Added HDL file(s): **{names}**\n"
+                f"📂 Current design files: {total}"
+            ).send()
+
+    # --- 2. REQUIRE AT LEAST ONE HDL FILE ---
+    if not hdl_files:
+        await cl.Message(
+            "⚠️ Please upload your HDL project files first "
+            "(`.v`, `.sv`, `.vhd`, packages, submodules etc.).\n"
+            "You can describe what to optimize in the same message as the upload."
+        ).send()
+        return
+
+    # --- 3. STREAMED RESPONSE (NO EMPTY PLACEHOLDER BUBBLE) ---
+    final_msg: cl.Message | None = None
+    think_step: cl.Step | None = None
     full_response_text = ""
 
-    # Call Agent with CURRENT history (excluding the new message to avoid duplication)
-    # The agent will combine: System + History + [Context + Current Query]
-    async for msg_type, content in agent.astream_run(message.content, history.messages, current_file):
-        
+    async for msg_type, content in agent.astream_run(
+        query=message.content,
+        chat_history=history.messages,
+        file_paths=hdl_files,
+    ):
         if msg_type == "think":
+            # Create a top-level thinking step (no parent_id), only once
             if not think_step:
                 think_step = cl.Step(
                     name="Thinking Process",
                     type="llm",
-                    parent_id=final_msg.id
                 )
                 await think_step.send()
-            
+
             await think_step.stream_token(content)
 
         elif msg_type == "text":
-            if think_step:
-                await think_step.update()
-                think_step = None
-            
-            full_response_text += content
-            await final_msg.stream_token(content)
+            # First visible text chunk → create and send the answer message
+            if final_msg is None:
+                final_msg = cl.Message(content=content)
+                await final_msg.send()
+                full_response_text += content
+            else:
+                full_response_text += content
+                await final_msg.stream_token(content)
 
+    # Finalize thinking + answer blocks
     if think_step:
         await think_step.update()
-    
-    await final_msg.update()
 
-    # Update History AFTER the generation
-    # 1. Add the clean user query (without the messy file context string)
+    if final_msg:
+        await final_msg.update()
+
+    # --- 4. UPDATE HISTORY ---
     history.add_user_message(message.content)
-    # 2. Add the AI response
     history.add_ai_message(full_response_text)
