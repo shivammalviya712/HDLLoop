@@ -13,8 +13,7 @@ async def start():
     cl.user_session.set("agent", MatlabAgent())
     cl.user_session.set("history", ChatMessageHistory()) 
     cl.user_session.set("active_file", None)
-    
-    await cl.Message("Matlab Agent Ready. I will reason before answering.").send()
+
 
 @cl.on_message
 async def main(message: cl.Message):
