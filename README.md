@@ -30,3 +30,7 @@ pip install -r requirements.txt
 ### Environment variables
 AI_API_KEY
 
+## Launching the application
+```
+chainlit run app_ui.py -w
+```

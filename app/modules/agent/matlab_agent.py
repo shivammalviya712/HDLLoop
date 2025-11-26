@@ -1,125 +1,143 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, TypedDict
+from pathlib import Path
+from typing import AsyncIterator, List, Any
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
-from langgraph.graph import END, StateGraph
 from langfuse.langchain import CallbackHandler
 
-from app.modules.ingestion.matlab_ingestor import MatlabIngestor
-from app.modules.memory.vector_memory import VectorMemory
-
-# Ensure environment variables (OpenAI, Langfuse, etc.) are available.
 load_dotenv()
 
-
-class AgentState(TypedDict, total=False):
-    """Shared state passed between LangGraph nodes."""
-
-    query: str
-    file_path: str
-    context_chunks: List[str]
-    full_code_context: str
-    generated_code: str
-
+# Where to dump raw chunk/event data for debugging
+CHUNK_LOG_PATH = Path(__file__).resolve().parents[3] / "chunk_dump.log"
 
 class MatlabAgent:
-    """LangGraph-powered agent that orchestrates ingestion, retrieval, and generation."""
-
     def __init__(self) -> None:
-        self.llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        self.ingestor = MatlabIngestor()
-        self.memory = VectorMemory()
-        self.graph = self._build_graph()
-
-    def run(self, query: str, file_path: str) -> str:
-        """
-        Execute the LangGraph pipeline for a given query and MATLAB file.
-
-        Args:
-            query: User request describing the refactor/change.
-            file_path: Absolute path to the MATLAB file to modify.
-
-        Returns:
-            The generated MATLAB code produced by the LLM node.
-        """
-        initial_state: AgentState = {
-            "query": query,
-            "file_path": os.path.abspath(file_path),
-        }
-        # Initialize Langfuse CallbackHandler for Langchain (tracing)
-        langfuse_handler = CallbackHandler()
-
-        result_state: AgentState = self.graph.invoke(
-            initial_state,
-            config={"callbacks": [langfuse_handler]})
-        return result_state.get("generated_code", "")
-
-    def _build_graph(self):
-        """Create and compile the linear LangGraph pipeline."""
-        builder = StateGraph(AgentState)
-        builder.add_node("_ingest_and_index", self._ingest_and_index)
-        builder.add_node("_retrieve", self._retrieve)
-        builder.add_node("_generate", self._generate)
-
-        builder.set_entry_point("_ingest_and_index")
-        builder.add_edge("_ingest_and_index", "_retrieve")
-        builder.add_edge("_retrieve", "_generate")
-        builder.add_edge("_generate", END)
-        return builder.compile()
-
-    # Node implementations -------------------------------------------------
-
-    def _ingest_and_index(self, state: AgentState) -> AgentState:
-        """Read MATLAB file, chunk content, and load it into the vector store."""
-        file_path = state["file_path"]
-        chunks = self.ingestor.ingest_file(file_path)
-        chunk_texts = [self._chunk_to_text(chunk) for chunk in chunks]
-        self.memory.index_chunks(chunk_texts)
-        return {
-            "full_code_context": "\n\n".join(chunk_texts),
-        }
-
-    def _retrieve(self, state: AgentState) -> AgentState:
-        """Grab the top-k relevant chunks for the query."""
-        query = state["query"]
-        context_chunks = self.memory.similarity_search(query, k=3)
-        return {"context_chunks": context_chunks}
-
-    def _generate(self, state: AgentState) -> AgentState:
-        """Call the LLM with a strong MATLAB-focused system prompt."""
-        system_prompt = (
-            "You are a MATLAB Expert. "
-            "Use 1-based indexing. "
-            "Prefer vectorization. "
-            "Output ONLY the MATLAB code block."
-        )
-        chunks_text = "\n\n".join(state.get("context_chunks", []))
-        full_context = state.get("full_code_context", "")
-        user_prompt = (
-            f"User request:\n{state['query']}\n\n"
-            f"Relevant snippets:\n{chunks_text}\n\n"
-            f"Full file context (may be truncated):\n{full_context}\n\n"
-            "Return only the updated MATLAB code."
+        self.llm = ChatOpenAI(
+            model=os.getenv("CONTRACT_AGENT_MODEL", "gpt-5.1"),
+            use_responses_api=True,
+            reasoning={"effort": "high", "summary": "auto"},
         )
 
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt),
-        ]
-        response = self.llm.invoke(messages)
-        generated_code = getattr(response, "content", "")
-        return {"generated_code": generated_code}
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a Senior MATLAB Expert."),
+            ("user", "{input}"),
+        ])
 
-    @staticmethod
-    def _chunk_to_text(chunk: Any) -> str:
-        """Normalize diverse chunk objects into plain strings."""
-        if isinstance(chunk, str):
-            return chunk
-        if hasattr(chunk, "text"):
-            return getattr(chunk, "text")
-        return str(chunk)
+    async def astream_run(
+        self, query: str, file_path: str | None = None
+    ) -> AsyncIterator[tuple[str, str]]:
+        """
+        Stream:
+        - ("think", ...) for model reasoning (summary stream)
+        - ("text", ...) for final visible answer
+        """
+        context = (
+            f"File Context: {os.path.abspath(file_path)}"
+            if file_path
+            else "No file context."
+        )
+        full_input = f"{context}\n\nUser Query: {query}"
 
+        config = {
+            "callbacks": [CallbackHandler()],
+            "metadata": {"thread_id": "1"},
+        }
+
+        # Build LC messages from the prompt template
+        messages = self.prompt.format_messages(input=full_input)
+
+        # Cache per-summary-index text so we only stream new characters
+        reasoning_cache: dict[int, str] = {}
+
+        async for event in self.llm.astream_events(messages, config=config):
+            if event.get("event") != "on_chat_model_stream":
+                continue
+
+            chunk = event["data"]["chunk"]
+            # Dump full chunk event payload for debugging/inspection
+            try:
+                with CHUNK_LOG_PATH.open("a", encoding="utf-8") as f:
+                    f.write(f"{event!r}\n\n")
+            except Exception:
+                # Don't break the stream if logging fails
+                pass
+
+            content = getattr(chunk, "content", None)
+
+            # ----- THINKING: parse reasoning parts -----
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+
+                    if part.get("type") != "reasoning":
+                        continue
+
+                    summary = part.get("summary", [])
+                    if not isinstance(summary, list):
+                        continue
+
+                    for s in summary:
+                        if not isinstance(s, dict):
+                            continue
+
+                        idx = s.get("index", 0)
+                        text = s.get("text", "")
+                        if not isinstance(text, str) or not text:
+                            continue
+
+                        prev = reasoning_cache.get(idx, "")
+
+                        # Compute new suffix vs previous text for this index
+                        common_prefix_len = 0
+                        for a, b in zip(prev, text):
+                            if a == b:
+                                common_prefix_len += 1
+                            else:
+                                break
+
+                        new_part = text[common_prefix_len:]
+                        reasoning_cache[idx] = text
+
+                        if new_part:
+                            # Stream just the new characters of the reasoning
+                            yield ("think", new_part)
+
+            # ----- ANSWER TEXT: normal visible output -----
+            text_piece = self._extract_text_from_chunk(chunk)
+            if text_piece:
+                yield ("text", text_piece)
+
+    def _extract_text_from_chunk(self, chunk: Any) -> str:
+        """
+        Extract plain answer text from chunk.content.
+        Skips reasoning parts entirely.
+        """
+        content = getattr(chunk, "content", "")
+
+        # Sometimes it's just a string
+        if isinstance(content, str):
+            return content
+
+        # responses API style: list of parts
+        if isinstance(content, list):
+            parts: List[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+
+                # Skip reasoning; we already handle that above
+                if part.get("type") == "reasoning":
+                    continue
+
+                text_value = part.get("text")
+                if isinstance(text_value, str) and text_value:
+                    parts.append(text_value)
+
+            return "".join(parts)
+
+        return ""
