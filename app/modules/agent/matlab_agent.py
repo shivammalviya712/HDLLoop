@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import os
-from typing import AsyncIterator
+from typing import AsyncIterator, List
 
 from dotenv import load_dotenv
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage
 from langchain_openai import ChatOpenAI
 from langfuse.langchain import CallbackHandler
 
@@ -14,19 +14,20 @@ class MatlabAgent:
     def __init__(self) -> None:
         self.llm = ChatOpenAI(
             model=os.getenv("CONTRACT_AGENT_MODEL", "gpt-5.1"),
-            use_responses_api=True, # This enables the list-based content structure
-            reasoning={"effort": "high", "summary": "auto"}, # Uncomment if your specific model config needs this
+            use_responses_api=True, 
+            reasoning={"effort": "high", "summary": "auto"},
         )
 
-        self.prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a Senior MATLAB Expert."),
-            ("user", "{input}"),
-        ])
+        # Removed self.prompt - we will construct messages dynamically in astream_run
 
     async def astream_run(
-        self, query: str, file_path: str | None = None
+        self, 
+        query: str, 
+        chat_history: List[BaseMessage], 
+        file_path: str | None = None
     ) -> AsyncIterator[tuple[str, str]]:
         
+        # 1. Prepare Contextualized Input
         context = (
             f"File Context: {os.path.abspath(file_path)}"
             if file_path
@@ -34,16 +35,24 @@ class MatlabAgent:
         )
         full_input = f"{context}\n\nUser Query: {query}"
 
+        # 2. Construct Message List: System -> History -> Current User Input
+        messages = [SystemMessage(content="You are a Senior MATLAB Expert.")]
+        
+        # Add previous conversation history
+        messages.extend(chat_history)
+        
+        # Add the current query with context
+        messages.append(HumanMessage(content=full_input))
+
         config = {
             "callbacks": [CallbackHandler()],
             "metadata": {"thread_id": "1"},
         }
-
-        messages = self.prompt.format_messages(input=full_input)
         
         # Track the index of the thought to know when to insert newlines
         current_thought_idx = 0
 
+        # Pass the constructed list of messages directly to the LLM
         async for chunk in self.llm.astream(messages, config=config):
             content = chunk.content
 
@@ -60,10 +69,8 @@ class MatlabAgent:
                         if isinstance(summary, list):
                             for item in summary:
                                 if isinstance(item, dict) and "text" in item:
-                                    # Check if this is a new thought step
                                     item_idx = item.get("index", 0)
                                     
-                                    # If index increased, insert a double newline for clean separation
                                     if item_idx > current_thought_idx:
                                         yield ("think", "\n\n")
                                         current_thought_idx = item_idx
@@ -76,6 +83,5 @@ class MatlabAgent:
                         if text_val:
                             yield ("text", text_val)
 
-            # Fallback for standard strings
             elif isinstance(content, str) and content:
                 yield ("text", content)
