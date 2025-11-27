@@ -63,7 +63,7 @@ class ResourceUtilizationRunner:
             f"[ResourceUtilizationRunner] Sleeping {self.config.post_run_sleep_seconds} seconds "
             "to allow synthesis to complete..."
         )
-        time.sleep(self.config.post_run_sleep_seconds)
+        # time.sleep(self.config.post_run_sleep_seconds)
 
         report_path = self._locate_report(
             project_dir=project_dir,

@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from .resource_report import ResourceReport
+from app.modules.hdl.resource_report import ResourceReport
 
 
 class VivadoResourceReportParser:
@@ -15,10 +15,8 @@ class VivadoResourceReportParser:
       - tool   -> "vivado"
       - target -> Device line in header
       - lut    -> 'Slice LUTs*' Used
-      - ff     -> 'Slice Registers' Used
       - dsp    -> 'DSPs' Used
       - bram   -> 'Block RAM Tile' Used
-      - uram   -> 'URAM' Used (if present)
     """
 
     def parse(self, report_path: Path) -> ResourceReport:
@@ -28,20 +26,15 @@ class VivadoResourceReportParser:
         target = self._parse_device(lines) or "unknown"
 
         lut = self._extract_used(lines, "Slice LUTs*")
-        ff = self._extract_used(lines, "Slice Registers")
         dsp = self._extract_used(lines, "DSPs")
         bram = self._extract_used(lines, "Block RAM Tile")
-        uram = self._extract_used(lines, "URAM")  # might be None on some devices
 
         return ResourceReport(
             tool="vivado",
             target=target,
             lut=lut,
-            ff=ff,
             dsp=dsp,
             bram=bram,
-            uram=uram,
-            fmax_mhz=None,  # utilization report doesn't contain fmax
         )
 
     # ----------------- Internals ----------------- #
@@ -63,14 +56,11 @@ class VivadoResourceReportParser:
         Row format is like:
           | Slice LUTs*             | 6528 | 0 | 0 | 303600 | 2.15 |
                  ^ label            ^ Used
-
-        We just split by '|' and take 2nd cell as 'Used'.
         """
         for line in lines:
             stripped = line.strip()
             if not stripped.startswith("|"):
                 continue
-            # quick filter, cheaper than splitting everything
             if f"| {label}" not in line:
                 continue
 

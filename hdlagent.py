@@ -11,6 +11,9 @@ from langfuse.langchain import CallbackHandler
 
 from hdl_flow import build_hdl_optimization_graph
 from CompileCheckTool import CompileCheckRunner
+# NOTE: assuming you exposed both VivadoConfig + ResourceUtilizationRunner
+# from ResourceUtilizationTool as per our earlier implementation.
+from app.modules.hdl.resource_config import VivadoConfig
 from ResourceUtilizationTool import ResourceUtilizationRunner
 
 load_dotenv()
@@ -36,10 +39,26 @@ class MatlabAgent:
             reasoning={"effort": "high", "summary": "auto"},
         )
         self.langfuse_handler = CallbackHandler()
-        self.resource_runner = ResourceUtilizationRunner(target="GenericFPGA")
+
+        # -------- Resource Utilization Runner (Vivado-based) -------- #
+        vivado_settings = Path(
+            "/mathworks/hub/share/apps/HDLTools/Vivado/2024.1-mw-1/"
+            "Lin/Vivado/2024.1/settings64.sh"
+        )
+        vivado_project_root = Path("/tmp/hdlloop_vivado_projects")
+
+        vivado_config = VivadoConfig(
+            settings_script=vivado_settings,
+            project_root=vivado_project_root,
+        )
+        self.resource_runner = ResourceUtilizationRunner(config=vivado_config)
+
+        # -------- Compile Check Runner (your existing tool) -------- #
         self.compile_runner = CompileCheckRunner()
+
         self.system_prompt_text = load_system_prompt()
 
+        # -------- Build LangGraph pipeline -------- #
         self.graph = build_hdl_optimization_graph(
             llm=self.llm,
             resource_runner=self.resource_runner,
@@ -168,7 +187,8 @@ class MatlabAgent:
     def _node_start_thinking(self, name: str) -> List[Tuple[str, str]]:
         if name == "resource_init":
             text = (
-                "➡️ [ResourceUtilization] Running initial resource utilization on your HDL design (stub)...\n"
+                "➡️ [ResourceUtilization] Running initial synthesis + "
+                "resource utilization on your HDL design...\n"
             )
         elif name == "agent":
             text = (
@@ -176,15 +196,46 @@ class MatlabAgent:
             )
         elif name == "compile_check":
             text = (
-                "➡️ [CompileCheck] Running compile check on the optimized HDL (stub)...\n"
+                "➡️ [CompileCheck] Running syntax/compile check on the optimized HDL...\n"
             )
         elif name == "resource_final":
             text = (
-                "➡️ [ResourceUtilization] Running final resource utilization after optimization (stub)...\n"
+                "➡️ [ResourceUtilization] Running final synthesis + "
+                "resource utilization after optimization...\n"
             )
         else:
             return []
         return [("think", text)]
+
+    def _format_resource_report_line(
+        self,
+        report: Dict[str, Any],
+        prefix: str,
+        top_name: str,
+    ) -> str:
+        """
+        Pretty-print a ResourceReport-like dict:
+        {tool, target, lut, dsp, bram}
+        """
+        tool = report.get("tool", "vivado")
+        target = report.get("target", "unknown")
+        lut = report.get("lut")
+        dsp = report.get("dsp")
+        bram = report.get("bram")
+
+        parts = []
+        if lut is not None:
+            parts.append(f"LUTs={lut}")
+        if dsp is not None:
+            parts.append(f"DSPs={dsp}")
+        if bram is not None:
+            parts.append(f"BRAMs={bram}")
+
+        metrics_str = ", ".join(parts) if parts else "no resource data available"
+        return (
+            f"✅ [ResourceUtilization] {prefix} for top '{top_name}' "
+            f"on {tool} target '{target}': {metrics_str}\n"
+        )
 
     def _node_end_messages(
         self,
@@ -194,43 +245,68 @@ class MatlabAgent:
         messages: List[Tuple[str, str]] = []
 
         if name == "resource_init":
-            base_summary = output.get("base_summary")
             top_name = output.get("top_name", "")
-            if base_summary:
-                messages.append(
-                    (
-                        "think",
-                        f"✅ [ResourceUtilization] Initial (stub) utilization for top '{top_name}': {base_summary}\n\n",
-                    )
+            # Prefer structured ResourceReport if available
+            report = output.get("resource_report")
+            if isinstance(report, dict):
+                line = self._format_resource_report_line(
+                    report, prefix="Initial utilization", top_name=top_name
                 )
+                messages.append(("think", line))
+            else:
+                # Backwards-compatible fallback
+                base_summary = output.get("base_summary")
+                if base_summary:
+                    messages.append(
+                        (
+                            "think",
+                            f"✅ [ResourceUtilization] Initial utilization "
+                            f"for top '{top_name}': {base_summary}\n\n",
+                        )
+                    )
 
         elif name == "compile_check":
             compile_ok = output.get("compile_ok", True)
             errors = output.get("compile_errors")
+
             if compile_ok:
                 messages.append(
-                    ("think", "✅ [CompileCheck] No compilation errors detected (stub).\n")
+                    (
+                        "think",
+                        "✅ [CompileCheck] No compilation errors detected.\n",
+                    )
                 )
             else:
                 messages.append(
                     (
                         "think",
-                        f"⚠️ [CompileCheck] Compilation errors detected (stub):\n{errors or ''}\n",
+                        "⚠️ [CompileCheck] Compilation errors detected:\n"
+                        f"{errors or ''}\n",
                     )
                 )
 
         elif name == "resource_final":
-            final_summary = output.get("final_summary")
-            summary_text = output.get("summary_text")
             top_name = output.get("top_name", "")
-            if final_summary:
-                messages.append(
-                    (
-                        "think",
-                        f"✅ [ResourceUtilization] Final (stub) utilization for top '{top_name}': {final_summary}\n",
-                    )
+            report = output.get("resource_report")
+            if isinstance(report, dict):
+                line = self._format_resource_report_line(
+                    report, prefix="Final utilization", top_name=top_name
                 )
+                messages.append(("think", line))
+            else:
+                final_summary = output.get("final_summary")
+                if final_summary:
+                    messages.append(
+                        (
+                            "think",
+                            f"✅ [ResourceUtilization] Final utilization "
+                            f"for top '{top_name}': {final_summary}\n",
+                        )
+                    )
+
+            summary_text = output.get("summary_text")
             if summary_text:
+                # This is the nice human-facing wrap-up
                 messages.append(("text", summary_text))
 
         return messages
