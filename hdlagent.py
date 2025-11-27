@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langfuse.langchain import CallbackHandler
 
+from hdl_flow import build_hdl_optimization_graph
+from CompileCheckTool import CompileCheckRunner
 from ResourceUtilizationTool import ResourceUtilizationRunner
 
 load_dotenv()
@@ -19,11 +20,13 @@ PROMPT_FILE_NAME = "hdl_optimization_prompt.txt"
 
 class MatlabAgent:
     """
-    Agent that:
-      - takes multi-file HDL designs,
-      - runs a resource utilization pass,
-      - forwards code + report + user query to an LLM with an HDL optimization prompt,
-      - streams thoughts + answer back to the UI.
+    Thin wrapper around the LangGraph HDL optimization flow.
+
+    - Validates HDL file paths.
+    - For "no files" / "missing files" cases, calls LLM directly.
+    - For valid files, runs the full graph:
+          resource_init -> agent -> compile_check -> resource_final
+    - Streams ("think", text) and ("text", text) tuples for the UI.
     """
 
     def __init__(self) -> None:
@@ -32,74 +35,279 @@ class MatlabAgent:
             use_responses_api=True,
             reasoning={"effort": "high", "summary": "auto"},
         )
+        self.langfuse_handler = CallbackHandler()
         self.resource_runner = ResourceUtilizationRunner(target="GenericFPGA")
+        self.compile_runner = CompileCheckRunner()
         self.system_prompt_text = load_system_prompt()
 
-    # ----------------- Public API ----------------- #
+        self.graph = build_hdl_optimization_graph(
+            llm=self.llm,
+            resource_runner=self.resource_runner,
+            compile_runner=self.compile_runner,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Public entrypoint used by app_ui.py
+    # ------------------------------------------------------------------ #
 
     async def astream_run(
         self,
         query: str,
         chat_history: List[BaseMessage],
         file_paths: Optional[List[str]] = None,
-    ) -> AsyncIterator[tuple[str, str]]:
-        """
-        Main entrypoint called by the UI.
+    ) -> AsyncIterator[Tuple[str, str]]:
+        """Main entry point called by the UI."""
 
-        - `file_paths`: list of HDL file paths (top + submodules + packages).
-        - Builds messages based on what files are available.
-        - Streams ("think", text) and ("text", text) tuples.
-        """
-        messages = self._build_messages(query, chat_history, file_paths)
-        async for kind, text in self._stream_llm(messages):
-            yield kind, text
+        if not file_paths:
+            async for item in self._run_no_files_flow(query, chat_history):
+                yield item
+            return
 
-    # ----------------- Message building ----------------- #
+        existing_paths = [str(p) for p in file_paths if Path(p).exists()]
+        if not existing_paths:
+            async for item in self._run_missing_files_flow(
+                query, chat_history, file_paths
+            ):
+                yield item
+            return
 
-    def _build_messages(
+        async for item in self._run_full_graph_flow(
+            query=query,
+            chat_history=chat_history,
+            hdl_paths=existing_paths,
+        ):
+            yield item
+
+    # ------------------------------------------------------------------ #
+    # Flows
+    # ------------------------------------------------------------------ #
+
+    async def _run_no_files_flow(
         self,
         query: str,
         chat_history: List[BaseMessage],
-        file_paths: Optional[List[str]],
-    ) -> List[BaseMessage]:
+    ) -> AsyncIterator[Tuple[str, str]]:
+        messages = self._build_no_files_messages(query, chat_history)
+        async for kind, text in self._stream_llm(messages, flow_name="hdl_no_files"):
+            yield kind, text
+
+    async def _run_missing_files_flow(
+        self,
+        query: str,
+        chat_history: List[BaseMessage],
+        file_paths: List[str],
+    ) -> AsyncIterator[Tuple[str, str]]:
+        messages = self._build_missing_paths_messages(query, chat_history, file_paths)
+        async for kind, text in self._stream_llm(
+            messages, flow_name="hdl_missing_files"
+        ):
+            yield kind, text
+
+    async def _run_full_graph_flow(
+        self,
+        query: str,
+        chat_history: List[BaseMessage],
+        hdl_paths: List[str],
+    ) -> AsyncIterator[Tuple[str, str]]:
+        """Run the full LangGraph: resource_init -> agent -> compile_check -> resource_final."""
+        initial_state: Dict[str, Any] = {
+            "hdl_paths": hdl_paths,
+            "query": query,
+            "chat_history": chat_history,
+            "system_prompt": self.system_prompt_text,
+        }
+
+        config = {
+            "callbacks": [self.langfuse_handler],
+            "metadata": {"flow": "hdl_full_optimization_graph"},
+        }
+
+        current_thought_idx = 0
+
+        async for event in self.graph.astream_events(
+            initial_state,
+            config=config,
+            version="v1",
+        ):
+            ev_type = event["event"]
+            name = event.get("name")
+
+            # Node start -> "thinking" markers
+            if ev_type == "on_chain_start" and name in {
+                "resource_init",
+                "agent",
+                "compile_check",
+                "resource_final",
+            }:
+                for msg in self._node_start_thinking(name):
+                    yield msg
+
+            # Node end -> summarize results we care about
+            if ev_type == "on_chain_end" and name in {
+                "resource_init",
+                "compile_check",
+                "resource_final",
+            }:
+                output = (event.get("data") or {}).get("output") or {}
+                for kind, text in self._node_end_messages(name, output):
+                    yield kind, text
+
+            # LLM streaming inside the agent node
+            if ev_type == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                events, current_thought_idx = self._process_llm_chunk(
+                    chunk, current_thought_idx
+                )
+                for kind, text in events:
+                    yield kind, text
+
+    # ------------------------------------------------------------------ #
+    # Node helpers
+    # ------------------------------------------------------------------ #
+
+    def _node_start_thinking(self, name: str) -> List[Tuple[str, str]]:
+        if name == "resource_init":
+            text = (
+                "➡️ [ResourceUtilization] Running initial resource utilization on your HDL design (stub)...\n"
+            )
+        elif name == "agent":
+            text = (
+                "➡️ [Agent] Passing HDL + utilization report to the optimization agent...\n"
+            )
+        elif name == "compile_check":
+            text = (
+                "➡️ [CompileCheck] Running compile check on the optimized HDL (stub)...\n"
+            )
+        elif name == "resource_final":
+            text = (
+                "➡️ [ResourceUtilization] Running final resource utilization after optimization (stub)...\n"
+            )
+        else:
+            return []
+        return [("think", text)]
+
+    def _node_end_messages(
+        self,
+        name: str,
+        output: Dict[str, Any],
+    ) -> List[Tuple[str, str]]:
+        messages: List[Tuple[str, str]] = []
+
+        if name == "resource_init":
+            base_summary = output.get("base_summary")
+            top_name = output.get("top_name", "")
+            if base_summary:
+                messages.append(
+                    (
+                        "think",
+                        f"✅ [ResourceUtilization] Initial (stub) utilization for top '{top_name}': {base_summary}\n\n",
+                    )
+                )
+
+        elif name == "compile_check":
+            compile_ok = output.get("compile_ok", True)
+            errors = output.get("compile_errors")
+            if compile_ok:
+                messages.append(
+                    ("think", "✅ [CompileCheck] No compilation errors detected (stub).\n")
+                )
+            else:
+                messages.append(
+                    (
+                        "think",
+                        f"⚠️ [CompileCheck] Compilation errors detected (stub):\n{errors or ''}\n",
+                    )
+                )
+
+        elif name == "resource_final":
+            final_summary = output.get("final_summary")
+            summary_text = output.get("summary_text")
+            top_name = output.get("top_name", "")
+            if final_summary:
+                messages.append(
+                    (
+                        "think",
+                        f"✅ [ResourceUtilization] Final (stub) utilization for top '{top_name}': {final_summary}\n",
+                    )
+                )
+            if summary_text:
+                messages.append(("text", summary_text))
+
+        return messages
+
+    # ------------------------------------------------------------------ #
+    # LLM helpers
+    # ------------------------------------------------------------------ #
+
+    async def _stream_llm(
+        self,
+        messages: List[BaseMessage],
+        flow_name: str,
+    ) -> AsyncIterator[Tuple[str, str]]:
+        """Simple LLM streaming for non-graph flows."""
+        config = {
+            "callbacks": [self.langfuse_handler],
+            "metadata": {"flow": flow_name},
+        }
+
+        current_thought_idx = 0
+
+        async for chunk in self.llm.astream(messages, config=config):
+            events, current_thought_idx = self._process_llm_chunk(
+                chunk, current_thought_idx
+            )
+            for kind, text in events:
+                yield kind, text
+
+    def _process_llm_chunk(
+        self,
+        chunk: Any,
+        current_idx: int,
+    ) -> Tuple[List[Tuple[str, str]], int]:
         """
-        Decide which prompt to send:
-          - no files at all,
-          - file paths invalid,
-          - or full multi-file design prompt.
+        Convert an OpenAI Responses API chunk into a list of
+        ('think', text) / ('text', text) events + updated reasoning index.
         """
-        if not file_paths:
-            return self._build_no_files_messages(query, chat_history)
+        events: List[Tuple[str, str]] = []
+        content = getattr(chunk, "content", chunk)
 
-        existing_paths = self._collect_existing_paths(file_paths)
-        if not existing_paths:
-            return self._build_missing_paths_messages(query, chat_history, file_paths)
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
 
-        top_name, hdl_bundle, base_summary = self._prepare_design_prompt_inputs(
-            existing_paths
-        )
+                if ptype == "reasoning":
+                    summary = part.get("summary", [])
+                    if isinstance(summary, list):
+                        for item in summary:
+                            if not isinstance(item, dict) or "text" not in item:
+                                continue
+                            idx = item.get("index", 0)
+                            if idx > current_idx:
+                                events.append(("think", "\n\n"))
+                                current_idx = idx
+                            events.append(("think", item["text"]))
 
-        full_input = self._format_design_prompt(
-            query=query,
-            top_name=top_name,
-            base_summary=base_summary,
-            hdl_bundle=hdl_bundle,
-        )
+                elif ptype == "text":
+                    txt = part.get("text", "")
+                    if txt:
+                        events.append(("text", txt))
 
-        return [
-            SystemMessage(content=self.system_prompt_text),
-            *chat_history,
-            HumanMessage(content=full_input),
-        ]
+        elif isinstance(content, str) and content:
+            events.append(("text", content))
+
+        return events, current_idx
+
+    # ------------------------------------------------------------------ #
+    # Prompt helpers
+    # ------------------------------------------------------------------ #
 
     def _build_no_files_messages(
         self,
         query: str,
         chat_history: List[BaseMessage],
     ) -> List[BaseMessage]:
-        """
-        Ask user to upload their HDL if we literally have none.
-        """
         human_text = (
             "No HDL files are attached.\n\n"
             "Ask the user to upload their HDL project files "
@@ -126,9 +334,6 @@ class MatlabAgent:
         chat_history: List[BaseMessage],
         file_paths: List[str],
     ) -> List[BaseMessage]:
-        """
-        If UI passed file paths but nothing exists on disk (e.g. temp cleanup).
-        """
         joined = "\n".join(file_paths)
         human_text = (
             "The HDL file paths provided by the UI do not exist on disk.\n\n"
@@ -149,154 +354,21 @@ class MatlabAgent:
             HumanMessage(content=human_text),
         ]
 
-    # ----------------- Design preparation helpers ----------------- #
-
-    def _collect_existing_paths(self, file_paths: List[str]) -> List[Path]:
-        """
-        Convert raw strings from the UI into Path objects
-        and filter out anything that doesn't exist.
-        """
-        existing: List[Path] = []
-        for path_str in file_paths:
-            p = Path(path_str)
-            if p.exists():
-                existing.append(p)
-        return existing
-
-    def _prepare_design_prompt_inputs(
-        self,
-        hdl_paths: List[Path],
-    ) -> tuple[str, str, str]:
-        """
-        Given a list of HDL files:
-          - choose a top module name (simple heuristic: stem of first file),
-          - build a unified text bundle with file headers,
-          - run resource utilization and return a human-readable summary.
-        """
-        top_name = hdl_paths[0].stem
-        hdl_bundle = self._build_hdl_bundle(hdl_paths)
-        base_report = self.resource_runner.run(file_paths=hdl_paths, top_name=top_name)
-        base_summary = base_report.to_human_summary()
-        return top_name, hdl_bundle, base_summary
-
-    def _build_hdl_bundle(self, hdl_paths: List[Path]) -> str:
-        """
-        Concatenate all HDL files into one text block, clearly marking
-        which file each section came from. This is what we feed to the LLM.
-        """
-        parts: List[str] = []
-
-        for p in hdl_paths:
-            try:
-                code = p.read_text()
-            except Exception as exc:
-                parts.append(f"// File: {p.name} (FAILED TO READ: {exc})\n")
-                continue
-
-            parts.append(f"// File: {p.name}\n{code}\n")
-
-        return "\n\n".join(parts)
-
-    def _format_design_prompt(
-        self,
-        query: str,
-        top_name: str,
-        base_summary: str,
-        hdl_bundle: str,
-    ) -> str:
-        """
-        Final human message template sent along with the system prompt.
-        """
-        return f"""
-            You are given an HDL design that spans multiple files (top module, submodules, packages).
-            Optimize it according to the user goal while respecting the optimization rules from the system prompt.
-
-            Top-level module name (heuristic): {top_name}
-
-            Resource utilization BEFORE optimization:
-            {base_summary}
-
-            HDL design (all files bundled):
-            ```verilog
-            {hdl_bundle}
-            ```
-            User goal / request:
-            {query}
-        """
-
-    # ----------------- LLM streaming ----------------- #
-
-    async def _stream_llm(
-        self,
-        messages: List[BaseMessage],
-    ) -> AsyncIterator[tuple[str, str]]:
-        """
-        Stream responses from the LLM, yielding:
-        - ("think", text) for reasoning traces,
-        - ("text", text) for user-visible answer chunks.
-        """
-        config = {
-            "callbacks": [CallbackHandler()],
-            "metadata": {"thread_id": "1"},
-        }
-
-        current_thought_idx = 0
-
-        async for chunk in self.llm.astream(messages, config=config):
-            content = chunk.content
-
-            # Responses API: list of typed parts
-            if isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-
-                    part_type = part.get("type")
-
-                    # 1) Internal reasoning
-                    if part_type == "reasoning":
-                        summary = part.get("summary", [])
-                        if isinstance(summary, list):
-                            for item in summary:
-                                if isinstance(item, dict) and "text" in item:
-                                    item_idx = item.get("index", 0)
-
-                                    # Separate blocks of thoughts with a blank line
-                                    if item_idx > current_thought_idx:
-                                        yield ("think", "\n\n")
-                                        current_thought_idx = item_idx
-
-                                    yield ("think", item["text"])
-
-                    # 2) Final visible text
-                    elif part_type == "text":
-                        text_val = part.get("text", "")
-                        if text_val:
-                            yield ("text", text_val)
-
-            # Fallback for plain-string content
-            elif isinstance(content, str) and content:
-                yield ("text", content)
 
 def load_system_prompt() -> str:
     """
     Load the HDL optimization prompt from a sibling text file.
-
-    Falls back to a minimal prompt if the file is missing or empty,
-    so the agent still works in dev environments.
+    Falls back to a simple default if the file is missing/empty.
     """
     prompt_path = Path(__file__).with_name(PROMPT_FILE_NAME)
 
-    try:
-        text = prompt_path.read_text(encoding="utf-8")
-        if not text.strip():
-            raise ValueError("Prompt file is empty")
-        return text
-    except Exception as exc:
-        # Fallback: short, safe prompt so nothing crashes
-        return (
-            "You are an expert FPGA/ASIC hardware engineer and HDL optimization assistant. "
-            "If the optimization goal or constraints are unclear, ask the user clarifying "
-            "questions before changing any HDL code.\n\n"
-            f"[Warning: failed to load {PROMPT_FILE_NAME}: {exc}]"
-        )
+    if prompt_path.exists():
+        text = prompt_path.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+
+    return (
+        "You are an expert FPGA/ASIC hardware engineer and HDL optimization assistant. "
+        "If the optimization goal or constraints are unclear, ask the user clarifying "
+        "questions before changing any HDL code."
+    )
