@@ -34,7 +34,7 @@ class MatlabAgent:
 
     def __init__(self) -> None:
         self.llm = ChatOpenAI(
-            model=os.getenv("CONTRACT_AGENT_MODEL", "gpt-5.1"),
+            model=os.getenv("CONTRACT_AGENT_MODEL", "gpt-5.2"),
             use_responses_api=True,
             reasoning={"effort": "high", "summary": "auto"},
         )
@@ -58,11 +58,16 @@ class MatlabAgent:
 
         self.system_prompt_text = load_system_prompt()
 
+        # Folder where optimized HDL files will be written per run
+        optimized_root = Path("/tmp/hdlloop_optimized_hdl")
+        optimized_root.mkdir(parents=True, exist_ok=True)
+
         # -------- Build LangGraph pipeline -------- #
         self.graph = build_hdl_optimization_graph(
             llm=self.llm,
             resource_runner=self.resource_runner,
             compile_runner=self.compile_runner,
+            optimized_root=optimized_root,
         )
 
     # ------------------------------------------------------------------ #
@@ -155,6 +160,7 @@ class MatlabAgent:
             if ev_type == "on_chain_start" and name in {
                 "resource_init",
                 "agent",
+                "apply_optimized_hdl",
                 "compile_check",
                 "resource_final",
             }:
@@ -164,6 +170,7 @@ class MatlabAgent:
             # Node end -> summarize results we care about
             if ev_type == "on_chain_end" and name in {
                 "resource_init",
+                "apply_optimized_hdl",
                 "compile_check",
                 "resource_final",
             }:
@@ -194,6 +201,11 @@ class MatlabAgent:
             text = (
                 "➡️ [Agent] Passing HDL + utilization report to the optimization agent...\n"
             )
+        elif name == "apply_optimized_hdl":
+            text = (
+                "➡️ [HDL Files] Saving the optimized HDL suggested by the agent "
+                "and wiring it into the second synthesis run...\n"
+            )
         elif name == "compile_check":
             text = (
                 "➡️ [CompileCheck] Running syntax/compile check on the optimized HDL...\n"
@@ -206,6 +218,7 @@ class MatlabAgent:
         else:
             return []
         return [("think", text)]
+
 
     def _format_resource_report_line(
         self,
@@ -264,6 +277,25 @@ class MatlabAgent:
                             f"for top '{top_name}': {base_summary}\n\n",
                         )
                     )
+
+        elif name == "apply_optimized_hdl":
+            changed_files = output.get("optimized_files") or []
+            if changed_files:
+                file_list = ", ".join(changed_files)
+                messages.append(
+                    (
+                        "think",
+                        f"✅ [HDL Files] Wrote optimized HDL for: {file_list}\n",
+                    )
+                )
+            else:
+                messages.append(
+                    (
+                        "think",
+                        "ℹ️ [HDL Files] No explicit optimized files detected in the "
+                        "agent response; proceeding with original design files.\n",
+                    )
+                )
 
         elif name == "compile_check":
             compile_ok = output.get("compile_ok", True)
